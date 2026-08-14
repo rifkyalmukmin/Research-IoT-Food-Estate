@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -47,20 +48,25 @@ const int wetValue = 1500;
 const int PH_PIN = 27;
 
 // =====================================================
-// KALIBRASI pH SEMENTARA
+// KALIBRASI pH
 // =====================================================
-
-// Berdasarkan pembacaan sensor kamu:
-// sekitar 0.400 V
-//
-// Untuk sementara kita anggap:
-// 0.400 V = pH 7
+// PENTING:
+// Nilai ini HARUS dikalibrasi berdasarkan modul pH yang digunakan.
+// 0.400 V hanya dipakai sebagai titik awal dari pengukuran sebelumnya.
+// Jangan menganggap tegangan di udara sebagai pH 7.
 
 const float PH_NEUTRAL_VOLTAGE = 0.400;
 
-// Sensitivitas sementara.
-// Nanti bisa dikalibrasi menggunakan buffer pH.
+// Perubahan tegangan per 1 pH.
+// Nilai awal 0.180 V/pH dipertahankan dari kode sebelumnya.
+// Setelah kalibrasi, ubah nilai ini sesuai hasil pengukuran.
 const float PH_SLOPE = 0.180;
+
+// Batas tegangan yang masih dianggap masuk akal untuk perhitungan
+// berdasarkan kalibrasi sementara di atas. Di luar rentang ini,
+// pH TIDAK dipaksa menjadi 0; nilai pH terakhir dipertahankan.
+const float PH_MIN_VALID_VOLTAGE = 0.05;
+const float PH_MAX_VALID_VOLTAGE = 1.70;
 
 // =====================================================
 // DS18B20
@@ -88,6 +94,8 @@ int moisturePercent = 0;
 int phADC = 0;
 float phVoltage = 0.0;
 float pH = 7.0;
+float lastValidPH = 7.0;
+bool phValid = true;
 
 // Temperature
 float temperatureC = 0.0;
@@ -138,14 +146,26 @@ int readPHRaw()
 
     for (int i = 0; i < 20; i++)
     {
-        sum += analogRead(
-            PH_PIN
-        );
-
+        sum += analogRead(PH_PIN);
         delay(2);
     }
 
-    return sum / 20;
+    return (int)(sum / 20);
+}
+
+// Baca tegangan ADC menggunakan pembacaan millivolt terkalibrasi ESP32.
+// Ini lebih aman daripada menganggap ADC selalu linear 0-3.3 V.
+float readPHVoltage()
+{
+    long sum = 0;
+
+    for (int i = 0; i < 20; i++)
+    {
+        sum += analogReadMilliVolts(PH_PIN);
+        delay(2);
+    }
+
+    return (sum / 20.0) / 1000.0;
 }
 
 // =====================================================
@@ -201,36 +221,39 @@ void readSensors()
     // pH
     // =================================================
 
-    phADC =
-        readPHRaw();
+    phADC = readPHRaw();
 
-    // Konversi ADC ke voltage
-    phVoltage =
-        phADC *
-        (3.3 / 4095.0);
+    // Gunakan pembacaan millivolt terkalibrasi ESP32.
+    phVoltage = readPHVoltage();
 
     // =================================================
     // HITUNG pH
     // =================================================
 
-    pH =
+    float calculatedPH =
         7.0 +
         (
-            (
-                PH_NEUTRAL_VOLTAGE -
-                phVoltage
-            )
-            /
-            PH_SLOPE
+            (PH_NEUTRAL_VOLTAGE - phVoltage)
+            / PH_SLOPE
         );
 
-    // Batasi pH antara 0 - 14
-    pH =
-        constrain(
-            pH,
-            0.0,
-            14.0
-        );
+    // Jangan langsung mengubah hasil negatif menjadi 0.
+    // Jika tegangan berada di luar rentang kalibrasi sementara,
+    // pertahankan nilai pH terakhir yang valid.
+    if (phVoltage < PH_MIN_VALID_VOLTAGE ||
+        phVoltage > PH_MAX_VALID_VOLTAGE ||
+        calculatedPH < 0.0 ||
+        calculatedPH > 14.0)
+    {
+        phValid = false;
+        pH = lastValidPH;
+    }
+    else
+    {
+        phValid = true;
+        pH = calculatedPH;
+        lastValidPH = pH;
+    }
 
     // =================================================
     // DS18B20
@@ -961,6 +984,9 @@ void loop()
             pH,
             2
         );
+
+        Serial.print("pH Status      : ");
+        Serial.println(phValid ? "VALID" : "DI LUAR KALIBRASI");
 
         Serial.print(
             "Suhu DS18B20   : "
