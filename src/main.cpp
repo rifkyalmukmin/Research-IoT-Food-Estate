@@ -1,8 +1,5 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -11,46 +8,6 @@
 #include <DallasTemperature.h>
 
 #include <math.h>
-
-// =====================================================
-// KONFIGURASI WIFI
-// =====================================================
-
-const char* WIFI_SSID = "PersibJuaraaaa";
-const char* WIFI_PASSWORD = "CodelabsPersib";
-
-// =====================================================
-// KONFIGURASI HIVEMQ CLOUD
-// =====================================================
-
-const char* MQTT_SERVER =
-    "c9ad72fd2aa34c84857753c4437ad26f.s1.eu.hivemq.cloud";
-
-const int MQTT_PORT = 8883;
-
-// Isi dengan Credentials yang dibuat di HiveMQ Cloud
-const char* MQTT_USER =
-    "iot_foodestate";
-
-const char* MQTT_PASSWORD =
-    "Azela$@32";
-
-// =====================================================
-// MQTT TOPIC
-// =====================================================
-
-const char* MQTT_TOPIC_DATA =
-    "smartfarm/sensor/data";
-
-const char* MQTT_TOPIC_STATUS =
-    "smartfarm/sensor/status";
-
-// =====================================================
-// MQTT CLIENT
-// =====================================================
-
-WiFiClientSecure espClient;
-PubSubClient mqttClient(espClient);
 
 // =====================================================
 // OLED
@@ -76,10 +33,9 @@ Adafruit_SSD1306 display(
 
 const int SOIL_PIN = 35;
 
-// Kalibrasi awal
-//
-// KERING -> ADC besar
-// BASAH  -> ADC kecil
+// Kalibrasi
+// Kering -> ADC besar
+// Basah  -> ADC kecil
 
 const int dryValue = 4095;
 const int wetValue = 1500;
@@ -88,18 +44,23 @@ const int wetValue = 1500;
 // SENSOR pH
 // =====================================================
 
-// GPIO34 sudah digunakan Soil Moisture
-// sehingga pH menggunakan GPIO35.
+const int PH_PIN = 27;
 
-const int PH_PIN = 34;
+// =====================================================
+// KALIBRASI pH SEMENTARA
+// =====================================================
 
-// Rumus awal pH
+// Berdasarkan pembacaan sensor kamu:
+// sekitar 0.400 V
 //
-// WAJIB dikalibrasi menggunakan
-// larutan buffer pH.
+// Untuk sementara kita anggap:
+// 0.400 V = pH 7
 
-const float PH_NEUTRAL_VOLTAGE = 2.50;
-const float PH_SLOPE = 0.18;
+const float PH_NEUTRAL_VOLTAGE = 0.400;
+
+// Sensitivitas sementara.
+// Nanti bisa dikalibrasi menggunakan buffer pH.
+const float PH_SLOPE = 0.180;
 
 // =====================================================
 // DS18B20
@@ -107,14 +68,16 @@ const float PH_SLOPE = 0.18;
 
 #define DS18B20_PIN 5
 
-OneWire oneWire(DS18B20_PIN);
+OneWire oneWire(
+    DS18B20_PIN
+);
 
 DallasTemperature temperatureSensor(
     &oneWire
 );
 
 // =====================================================
-// DATA SENSOR
+// VARIABEL SENSOR
 // =====================================================
 
 // Soil
@@ -129,12 +92,12 @@ float pH = 7.0;
 // Temperature
 float temperatureC = 0.0;
 
-// Status
+// Status tanah
 String status = "";
 
-// 0 = kering
-// 1 = lembab
-// 2 = basah
+// 0 = Kering
+// 1 = Lembab
+// 2 = Basah
 int faceState = 1;
 
 // =====================================================
@@ -144,157 +107,6 @@ int faceState = 1;
 unsigned long lastSensorRead = 0;
 
 const unsigned long SENSOR_INTERVAL = 2000;
-
-// =====================================================
-// WIFI
-// =====================================================
-
-void connectWiFi()
-{
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        return;
-    }
-
-    Serial.println();
-    Serial.print("Menghubungkan WiFi: ");
-    Serial.println(WIFI_SSID);
-
-    WiFi.mode(WIFI_STA);
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD
-    );
-
-    int attempt = 0;
-
-    while (
-        WiFi.status() != WL_CONNECTED &&
-        attempt < 30
-    )
-    {
-        delay(500);
-
-        Serial.print(".");
-
-        attempt++;
-    }
-
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        Serial.println(
-            "WiFi berhasil terhubung!"
-        );
-
-        Serial.print("IP ESP32: ");
-
-        Serial.println(
-            WiFi.localIP()
-        );
-
-        Serial.print("RSSI: ");
-
-        Serial.print(
-            WiFi.RSSI()
-        );
-
-        Serial.println(" dBm");
-    }
-    else
-    {
-        Serial.println(
-            "WiFi gagal terhubung!"
-        );
-    }
-}
-
-// =====================================================
-// MQTT / HIVEMQ CONNECT
-// =====================================================
-
-void connectMQTT()
-{
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        return;
-    }
-
-    while (!mqttClient.connected())
-    {
-        Serial.println();
-        Serial.println(
-            "Menghubungkan ke HiveMQ Cloud..."
-        );
-
-        // Buat Client ID unik
-        String clientId =
-            "ESP32-SmartFarm-" +
-            String(
-                (uint32_t)ESP.getEfuseMac(),
-                HEX
-            );
-
-        bool connected =
-            mqttClient.connect(
-                clientId.c_str(),
-                MQTT_USER,
-                MQTT_PASSWORD
-            );
-
-        if (connected)
-        {
-            Serial.println(
-                "HiveMQ Cloud BERHASIL terhubung!"
-            );
-
-            Serial.print(
-                "MQTT Host: "
-            );
-
-            Serial.println(
-                MQTT_SERVER
-            );
-
-            Serial.print(
-                "MQTT Port: "
-            );
-
-            Serial.println(
-                MQTT_PORT
-            );
-
-            // Beritahu backend bahwa device online
-            mqttClient.publish(
-                MQTT_TOPIC_STATUS,
-                "online",
-                true
-            );
-
-            Serial.println(
-                "Status online terkirim."
-            );
-        }
-        else
-        {
-            Serial.print(
-                "HiveMQ gagal terhubung."
-            );
-
-            Serial.print(
-                " MQTT state = "
-            );
-
-            Serial.println(
-                mqttClient.state()
-            );
-
-            delay(3000);
-        }
-    }
-}
 
 // =====================================================
 // BACA SOIL MOISTURE
@@ -317,7 +129,7 @@ int readSoilRaw()
 }
 
 // =====================================================
-// BACA SENSOR pH
+// BACA pH
 // =====================================================
 
 int readPHRaw()
@@ -386,15 +198,20 @@ void readSensors()
     }
 
     // =================================================
-    // SENSOR pH
+    // pH
     // =================================================
 
     phADC =
         readPHRaw();
 
+    // Konversi ADC ke voltage
     phVoltage =
         phADC *
         (3.3 / 4095.0);
+
+    // =================================================
+    // HITUNG pH
+    // =================================================
 
     pH =
         7.0 +
@@ -407,6 +224,7 @@ void readSensors()
             PH_SLOPE
         );
 
+    // Batasi pH antara 0 - 14
     pH =
         constrain(
             pH,
@@ -438,126 +256,6 @@ void readSensors()
             "WARNING: DS18B20 tidak terdeteksi!"
         );
     }
-}
-
-// =====================================================
-// MQTT PUBLISH SENSOR
-// =====================================================
-
-void publishSensorData()
-{
-    if (!mqttClient.connected())
-    {
-        Serial.println(
-            "MQTT tidak terhubung."
-        );
-
-        return;
-    }
-
-    // =================================================
-    // JSON PAYLOAD
-    // =================================================
-
-    String payload = "{";
-
-    payload +=
-        "\"device_id\":\"ESP32-001\"";
-
-    payload +=
-        ",\"soil_adc\":";
-
-    payload +=
-        String(sensorValue);
-
-    payload +=
-        ",\"moisture\":";
-
-    payload +=
-        String(moisturePercent);
-
-    payload +=
-        ",\"status\":\"";
-
-    payload +=
-        status;
-
-    payload += "\"";
-
-    payload +=
-        ",\"ph_adc\":";
-
-    payload +=
-        String(phADC);
-
-    payload +=
-        ",\"ph_voltage\":";
-
-    payload +=
-        String(
-            phVoltage,
-            3
-        );
-
-    payload +=
-        ",\"ph\":";
-
-    payload +=
-        String(
-            pH,
-            2
-        );
-
-    payload +=
-        ",\"temperature\":";
-
-    payload +=
-        String(
-            temperatureC,
-            2
-        );
-
-    payload += "}";
-
-    // =================================================
-    // TAMPILKAN DI SERIAL
-    // =================================================
-
-    Serial.println();
-    Serial.println(
-        "========== MQTT DATA =========="
-    );
-
-    Serial.println(
-        payload
-    );
-
-    // =================================================
-    // PUBLISH
-    // =================================================
-
-    bool success =
-        mqttClient.publish(
-            MQTT_TOPIC_DATA,
-            payload.c_str()
-        );
-
-    if (success)
-    {
-        Serial.println(
-            "MQTT Publish: BERHASIL"
-        );
-    }
-    else
-    {
-        Serial.println(
-            "MQTT Publish: GAGAL"
-        );
-    }
-
-    Serial.println(
-        "==============================="
-    );
 }
 
 // =====================================================
@@ -708,13 +406,9 @@ void drawFace(int state)
     int ox = 0;
     int oy = 0;
 
-    // =================================================
-    // GERAKAN
-    // =================================================
-
+    // Basah -> memantul
     if (state == 2)
     {
-        // Basah -> memantul
         oy =
             (int)round(
                 3.0 *
@@ -723,9 +417,10 @@ void drawFace(int state)
                 )
             );
     }
+
+    // Lembab -> bergoyang
     else if (state == 1)
     {
-        // Lembab -> bergoyang
         ox =
             (int)round(
                 2.0 *
@@ -738,10 +433,7 @@ void drawFace(int state)
     int fx = cx + ox;
     int fy = cy + oy;
 
-    // =================================================
-    // WAJAH
-    // =================================================
-
+    // Wajah
     display.drawCircle(
         fx,
         fy,
@@ -814,7 +506,6 @@ void drawFace(int state)
             );
         }
 
-        // Senyum lebar
         drawSmile(
             fx,
             fy + 3,
@@ -911,7 +602,6 @@ void drawFace(int state)
             );
         }
 
-        // Senyum tipis
         drawSmile(
             fx,
             fy + 6,
@@ -974,9 +664,7 @@ void drawFace(int state)
         int ty =
             eyeY +
             4 +
-            (int)(
-                p * 20
-            );
+            (int)(p * 20);
 
         display.fillCircle(
             lx,
@@ -1014,79 +702,39 @@ void drawHeader()
 
     display.setTextSize(1);
 
-    // Contoh:
-    // LEMBAB 55% 28.4C
-
-    String line =
-        status +
-        " " +
-        String(
-            moisturePercent
-        ) +
-        "% " +
-        String(
-            temperatureC,
-            1
-        ) +
-        "C";
-
-    int w =
-        line.length() * 6;
-
-    int x =
-        (SCREEN_WIDTH - w) / 2;
-
-    if (x < 0)
-    {
-        x = 0;
-    }
+    // Baris atas:
+    // L:36% pH:7.01 23.5C
 
     display.setCursor(
-        x,
+        0,
         0
     );
 
+    display.print("L:");
+
     display.print(
-        line
+        moisturePercent
     );
 
-    display.drawFastHLine(
-        0,
-        10,
-        SCREEN_WIDTH,
-        SSD1306_WHITE
-    );
-}
+    display.print("%");
 
-// =====================================================
-// TAMPILKAN DATA SENSOR DI OLED
-// =====================================================
-
-void drawSensorInfo()
-{
-    display.setTextColor(
-        SSD1306_WHITE
-    );
-
-    display.setTextSize(1);
-
+    // pH
     display.setCursor(
-        2,
-        55
+        45,
+        0
     );
 
-    display.print(
-        "pH:"
-    );
+    display.print("pH:");
 
     display.print(
         pH,
         2
     );
 
+    // Suhu
     display.setCursor(
-        80,
-        55
+        96,
+        0
     );
 
     display.print(
@@ -1094,8 +742,14 @@ void drawSensorInfo()
         1
     );
 
-    display.print(
-        "C"
+    display.print("C");
+
+    // Garis pembatas
+    display.drawFastHLine(
+        0,
+        10,
+        SCREEN_WIDTH,
+        SSD1306_WHITE
     );
 }
 
@@ -1156,7 +810,7 @@ void setup()
     temperatureSensor.begin();
 
     // =================================================
-    // SPLASH SCREEN
+    // SPLASH
     // =================================================
 
     display.clearDisplay();
@@ -1173,76 +827,36 @@ void setup()
     );
 
     display.println(
-        "SMART"
+        "ANIMASI"
     );
 
     display.setCursor(
-        4,
+        40,
         30
     );
 
     display.println(
-        "FARM"
+        "v5"
     );
 
     display.setTextSize(1);
 
     display.setCursor(
-        70,
+        15,
         52
     );
 
     display.println(
-        "MQTT"
+        "Soil + pH + Temp"
     );
 
     display.display();
 
-    delay(2000);
-
-    // =================================================
-    // WIFI
-    // =================================================
-
-    connectWiFi();
-
-    // =================================================
-    // TLS
-    // =================================================
-
-    // Untuk tahap testing.
-    // Untuk produksi sebaiknya gunakan
-    // CA certificate HiveMQ.
-
-    espClient.setInsecure();
-
-    // =================================================
-    // MQTT
-    // =================================================
-
-    mqttClient.setServer(
-        MQTT_SERVER,
-        MQTT_PORT
-    );
-
-    // Payload JSON cukup kecil,
-    // tetapi kita beri buffer lebih besar.
-
-    mqttClient.setBufferSize(512);
-
-    // =================================================
-    // MQTT CONNECT
-    // =================================================
-
-    connectMQTT();
-
-    // =================================================
-    // SERIAL HEADER
-    // =================================================
+    delay(2500);
 
     Serial.println();
     Serial.println(
-        "========================================"
+        "================================"
     );
 
     Serial.println(
@@ -1250,39 +864,15 @@ void setup()
     );
 
     Serial.println(
-        "ESP32 + Soil Moisture + pH + DS18B20"
+        "ESP32 + Soil + pH + DS18B20"
     );
 
     Serial.println(
-        "OLED + HiveMQ Cloud MQTT"
+        "OLED"
     );
 
     Serial.println(
-        "========================================"
-    );
-
-    Serial.print(
-        "HiveMQ Host: "
-    );
-
-    Serial.println(
-        MQTT_SERVER
-    );
-
-    Serial.print(
-        "HiveMQ Port: "
-    );
-
-    Serial.println(
-        MQTT_PORT
-    );
-
-    Serial.print(
-        "MQTT Topic: "
-    );
-
-    Serial.println(
-        MQTT_TOPIC_DATA
+        "================================"
     );
 }
 
@@ -1292,38 +882,6 @@ void setup()
 
 void loop()
 {
-    // =================================================
-    // WIFI
-    // =================================================
-
-    if (
-        WiFi.status() !=
-        WL_CONNECTED
-    )
-    {
-        connectWiFi();
-    }
-
-    // =================================================
-    // MQTT
-    // =================================================
-
-    if (
-        !mqttClient.connected()
-    )
-    {
-        connectMQTT();
-    }
-
-    // Harus dipanggil terus
-    // untuk menjaga koneksi MQTT.
-
-    mqttClient.loop();
-
-    // =================================================
-    // TIMER
-    // =================================================
-
     unsigned long now =
         millis();
 
@@ -1338,7 +896,6 @@ void loop()
     {
         lastSensorRead = now;
 
-        // Baca semua sensor
         readSensors();
 
         // =================================================
@@ -1346,6 +903,7 @@ void loop()
         // =================================================
 
         Serial.println();
+
         Serial.println(
             "========== SENSOR DATA =========="
         );
@@ -1366,9 +924,7 @@ void loop()
             moisturePercent
         );
 
-        Serial.println(
-            "%"
-        );
+        Serial.println("%");
 
         Serial.print(
             "Status         : "
@@ -1395,9 +951,7 @@ void loop()
             3
         );
 
-        Serial.println(
-            " V"
-        );
+        Serial.println(" V");
 
         Serial.print(
             "pH             : "
@@ -1409,7 +963,7 @@ void loop()
         );
 
         Serial.print(
-            "Suhu           : "
+            "Suhu DS18B20   : "
         );
 
         Serial.print(
@@ -1417,19 +971,11 @@ void loop()
             2
         );
 
-        Serial.println(
-            " C"
-        );
+        Serial.println(" C");
 
         Serial.println(
             "================================="
         );
-
-        // =================================================
-        // MQTT
-        // =================================================
-
-        publishSensorData();
     }
 
     // =================================================
@@ -1444,10 +990,8 @@ void loop()
         faceState
     );
 
-    drawSensorInfo();
-
     display.display();
 
-    // sekitar 25 FPS
+    // ~25 FPS
     delay(40);
 }
