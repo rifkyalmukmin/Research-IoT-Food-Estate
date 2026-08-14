@@ -1,997 +1,269 @@
 #include <Arduino.h>
-#include <Wire.h>
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-
-#include <OneWire.h>
-#include <DallasTemperature.h>
-
-#include <math.h>
+#include "config.h"
+#include "sensors.h"
+#include "fuzzy.h"
+#include "display.h"
+#include "network.h"
 
 // =====================================================
-// OLED
+// POTANI — soil probe genggam berbasis sesi
+// -----------------------------------------------------
+// Alur: IDLE -> READING -> STABILIZING -> INFERENCE ->
+//       DISPLAY -> PUBLISH -> IDLE
+// Fuzzy dijalankan di perangkat, jadi hasil tetap tampil
+// di OLED walau tanpa jaringan.
 // =====================================================
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+enum State {
+    S_IDLE,
+    S_READING,
+    S_STABILIZING,
+    S_INFERENCE,
+    S_DISPLAY,
+    S_PUBLISH,
+    S_ERROR
+};
 
-#define OLED_SDA 21
-#define OLED_SCL 22
-#define OLED_ADDR 0x3C
+static State state = S_IDLE;
 
-Adafruit_SSD1306 display(
-    SCREEN_WIDTH,
-    SCREEN_HEIGHT,
-    &Wire,
-    -1
-);
+static SensorReading lastReading;
+static FuzzyResult   lastResult;
+static bool          lastStable = true;
 
-// =====================================================
-// SOIL MOISTURE
-// =====================================================
+// -------- buffer kestabilan pH (5 pembacaan terakhir) --------
+static float phBuf[STABILITY_WINDOW];
+static int   phBufIdx   = 0;
+static int   phBufCount = 0;
 
-const int SOIL_PIN = 35;
+static unsigned long readingStart = 0;   // awal sesi baca
+static unsigned long stableSince  = 0;   // saat selisih pertama < ambang
+static unsigned long lastSampleAt = 0;
+static unsigned long displayStart = 0;
 
-// Kalibrasi
-// Kering -> ADC besar
-// Basah  -> ADC kecil
+static void resetStability() {
+    phBufIdx = phBufCount = 0;
+    stableSince = 0;
+}
 
-const int dryValue = 4095;
-const int wetValue = 1500;
+static void pushPH(float v) {
+    phBuf[phBufIdx] = v;
+    phBufIdx = (phBufIdx + 1) % STABILITY_WINDOW;
+    if (phBufCount < STABILITY_WINDOW) phBufCount++;
+}
 
-// =====================================================
-// SENSOR pH
-// =====================================================
-
-const int PH_PIN = 27;
-
-// =====================================================
-// KALIBRASI pH SEMENTARA
-// =====================================================
-
-// Berdasarkan pembacaan sensor kamu:
-// sekitar 0.400 V
-//
-// Untuk sementara kita anggap:
-// 0.400 V = pH 7
-
-const float PH_NEUTRAL_VOLTAGE = 0.400;
-
-// Sensitivitas sementara.
-// Nanti bisa dikalibrasi menggunakan buffer pH.
-const float PH_SLOPE = 0.180;
-
-// =====================================================
-// DS18B20
-// =====================================================
-
-#define DS18B20_PIN 5
-
-OneWire oneWire(
-    DS18B20_PIN
-);
-
-DallasTemperature temperatureSensor(
-    &oneWire
-);
-
-// =====================================================
-// VARIABEL SENSOR
-// =====================================================
-
-// Soil
-int sensorValue = 0;
-int moisturePercent = 0;
-
-// pH
-int phADC = 0;
-float phVoltage = 0.0;
-float pH = 7.0;
-
-// Temperature
-float temperatureC = 0.0;
-
-// Status tanah
-String status = "";
-
-// 0 = Kering
-// 1 = Lembab
-// 2 = Basah
-int faceState = 1;
-
-// =====================================================
-// TIMER
-// =====================================================
-
-unsigned long lastSensorRead = 0;
-
-const unsigned long SENSOR_INTERVAL = 2000;
-
-// =====================================================
-// BACA SOIL MOISTURE
-// =====================================================
-
-int readSoilRaw()
-{
-    long sum = 0;
-
-    for (int i = 0; i < 10; i++)
-    {
-        sum += analogRead(
-            SOIL_PIN
-        );
-
-        delay(3);
+// selisih max-min dari buffer; besar bila belum penuh
+static float phSpread() {
+    if (phBufCount < STABILITY_WINDOW) return 999.0f;
+    float mn = phBuf[0], mx = phBuf[0];
+    for (int i = 1; i < phBufCount; i++) {
+        if (phBuf[i] < mn) mn = phBuf[i];
+        if (phBuf[i] > mx) mx = phBuf[i];
     }
-
-    return sum / 10;
+    return mx - mn;
 }
 
 // =====================================================
-// BACA pH
+// PERINTAH SERIAL (pemicu sementara pengganti tombol)
+// -----------------------------------------------------
+// "measure"  -> mulai sesi pengukuran
+// "selftest" -> jalankan verifikasi fuzzy (CSV)
+// TODO: ganti dengan tombol fisik GPIO<n>
 // =====================================================
+static String serialLine;
 
-int readPHRaw()
-{
-    long sum = 0;
-
-    for (int i = 0; i < 20; i++)
-    {
-        sum += analogRead(
-            PH_PIN
-        );
-
-        delay(2);
+static String pollCommand() {
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            String cmd = serialLine;
+            serialLine = "";
+            cmd.trim();
+            cmd.toLowerCase();
+            if (cmd.length() > 0) return cmd;
+        } else {
+            serialLine += c;
+        }
     }
-
-    return sum / 20;
+    return "";
 }
 
-// =====================================================
-// BACA SEMUA SENSOR
-// =====================================================
-
-void readSensors()
-{
-    // =================================================
-    // SOIL MOISTURE
-    // =================================================
-
-    sensorValue =
-        readSoilRaw();
-
-    moisturePercent =
-        map(
-            sensorValue,
-            dryValue,
-            wetValue,
-            0,
-            100
-        );
-
-    moisturePercent =
-        constrain(
-            moisturePercent,
-            0,
-            100
-        );
-
-    // =================================================
-    // STATUS TANAH
-    // =================================================
-
-    if (moisturePercent < 30)
-    {
-        status = "KERING";
-        faceState = 0;
-    }
-    else if (moisturePercent < 70)
-    {
-        status = "LEMBAB";
-        faceState = 1;
-    }
-    else
-    {
-        status = "BASAH";
-        faceState = 2;
-    }
-
-    // =================================================
-    // pH
-    // =================================================
-
-    phADC =
-        readPHRaw();
-
-    // Konversi ADC ke voltage
-    phVoltage =
-        phADC *
-        (3.3 / 4095.0);
-
-    // =================================================
-    // HITUNG pH
-    // =================================================
-
-    pH =
-        7.0 +
-        (
-            (
-                PH_NEUTRAL_VOLTAGE -
-                phVoltage
-            )
-            /
-            PH_SLOPE
-        );
-
-    // Batasi pH antara 0 - 14
-    pH =
-        constrain(
-            pH,
-            0.0,
-            14.0
-        );
-
-    // =================================================
-    // DS18B20
-    // =================================================
-
-    temperatureSensor
-        .requestTemperatures();
-
-    float temp =
-        temperatureSensor
-            .getTempCByIndex(0);
-
-    if (
-        temp !=
-        DEVICE_DISCONNECTED_C
-    )
-    {
-        temperatureC = temp;
-    }
-    else
-    {
-        Serial.println(
-            "WARNING: DS18B20 tidak terdeteksi!"
-        );
-    }
+static bool triggerPressed(const String &cmd) {
+    // tombol fisik belum ada -> pakai "measure" via serial
+    return cmd == "measure";
 }
 
-// =====================================================
-// GAMBAR SENYUM
-// =====================================================
-
-void drawSmile(
-    int cx,
-    int baseY,
-    int w,
-    int depth
-)
-{
-    for (
-        int dx = -w;
-        dx <= w;
-        dx++
-    )
-    {
-        int y =
-            baseY +
-            (
-                depth *
-                (
-                    w * w -
-                    dx * dx
-                )
-            )
-            /
-            (w * w);
-
-        display.drawPixel(
-            cx + dx,
-            y,
-            SSD1306_WHITE
-        );
-
-        display.drawPixel(
-            cx + dx,
-            y + 1,
-            SSD1306_WHITE
-        );
-    }
-}
-
-// =====================================================
-// GAMBAR SEDIH
-// =====================================================
-
-void drawFrown(
-    int cx,
-    int baseY,
-    int w,
-    int depth
-)
-{
-    for (
-        int dx = -w;
-        dx <= w;
-        dx++
-    )
-    {
-        int y =
-            baseY +
-            (
-                depth *
-                dx *
-                dx
-            )
-            /
-            (w * w);
-
-        display.drawPixel(
-            cx + dx,
-            y,
-            SSD1306_WHITE
-        );
-
-        display.drawPixel(
-            cx + dx,
-            y + 1,
-            SSD1306_WHITE
-        );
-    }
-}
-
-// =====================================================
-// SPARKLE
-// =====================================================
-
-void drawSparkle(
-    int x,
-    int y,
-    int s
-)
-{
-    display.drawFastVLine(
-        x,
-        y - s,
-        2 * s + 1,
-        SSD1306_WHITE
-    );
-
-    display.drawFastHLine(
-        x - s,
-        y,
-        2 * s + 1,
-        SSD1306_WHITE
-    );
-
-    display.drawPixel(
-        x - s + 1,
-        y - s + 1,
-        SSD1306_WHITE
-    );
-
-    display.drawPixel(
-        x + s - 1,
-        y - s + 1,
-        SSD1306_WHITE
-    );
-
-    display.drawPixel(
-        x - s + 1,
-        y + s - 1,
-        SSD1306_WHITE
-    );
-
-    display.drawPixel(
-        x + s - 1,
-        y + s - 1,
-        SSD1306_WHITE
-    );
-}
-
-// =====================================================
-// WAJAH ANIMASI
-// =====================================================
-
-void drawFace(int state)
-{
-    unsigned long t = millis();
-
-    int cx = 64;
-    int cy = 42;
-    int r = 20;
-
-    int ox = 0;
-    int oy = 0;
-
-    // Basah -> memantul
-    if (state == 2)
-    {
-        oy =
-            (int)round(
-                3.0 *
-                sin(
-                    t / 140.0
-                )
-            );
-    }
-
-    // Lembab -> bergoyang
-    else if (state == 1)
-    {
-        ox =
-            (int)round(
-                2.0 *
-                sin(
-                    t / 400.0
-                )
-            );
-    }
-
-    int fx = cx + ox;
-    int fy = cy + oy;
-
-    // Wajah
-    display.drawCircle(
-        fx,
-        fy,
-        r,
-        SSD1306_WHITE
-    );
-
-    int eyeDX = 8;
-
-    int eyeY =
-        fy - 6;
-
-    int lx =
-        fx - eyeDX;
-
-    int rx =
-        fx + eyeDX;
-
-    bool blink =
-        (t % 2500) < 150;
-
-    // =================================================
-    // BASAH
-    // =================================================
-
-    if (state == 2)
-    {
-        bool happyEye =
-            ((t / 1500) % 2) == 0;
-
-        if (happyEye)
-        {
-            for (
-                int dx = -3;
-                dx <= 3;
-                dx++
-            )
-            {
-                int ey =
-                    eyeY +
-                    (dx * dx) / 4;
-
-                display.drawPixel(
-                    lx + dx,
-                    ey,
-                    SSD1306_WHITE
-                );
-
-                display.drawPixel(
-                    rx + dx,
-                    ey,
-                    SSD1306_WHITE
-                );
-            }
-        }
-        else
-        {
-            display.fillCircle(
-                lx,
-                eyeY,
-                3,
-                SSD1306_WHITE
-            );
-
-            display.fillCircle(
-                rx,
-                eyeY,
-                3,
-                SSD1306_WHITE
-            );
-        }
-
-        drawSmile(
-            fx,
-            fy + 3,
-            11,
-            7
-        );
-
-        // Pipi
-        display.drawCircle(
-            fx - 14,
-            fy + 4,
-            2,
-            SSD1306_WHITE
-        );
-
-        display.drawCircle(
-            fx + 14,
-            fy + 4,
-            2,
-            SSD1306_WHITE
-        );
-
-        // Sparkle
-        if (
-            (t / 350) % 2 == 0
-        )
-        {
-            drawSparkle(
-                cx - 30,
-                cy - 14,
-                3
-            );
-        }
-
-        if (
-            (t / 350) % 3 == 0
-        )
-        {
-            drawSparkle(
-                cx + 32,
-                cy - 8,
-                2
-            );
-        }
-
-        if (
-            (t / 350) % 2 == 1
-        )
-        {
-            drawSparkle(
-                cx + 28,
-                cy + 16,
-                3
-            );
-        }
-    }
-
-    // =================================================
-    // LEMBAB
-    // =================================================
-
-    else if (state == 1)
-    {
-        if (blink)
-        {
-            display.drawFastHLine(
-                lx - 3,
-                eyeY,
-                6,
-                SSD1306_WHITE
-            );
-
-            display.drawFastHLine(
-                rx - 3,
-                eyeY,
-                6,
-                SSD1306_WHITE
-            );
-        }
-        else
-        {
-            display.fillCircle(
-                lx,
-                eyeY,
-                3,
-                SSD1306_WHITE
-            );
-
-            display.fillCircle(
-                rx,
-                eyeY,
-                3,
-                SSD1306_WHITE
-            );
-        }
-
-        drawSmile(
-            fx,
-            fy + 6,
-            8,
-            3
-        );
-    }
-
-    // =================================================
-    // KERING
-    // =================================================
-
-    else
-    {
-        // Alis khawatir
-        display.drawLine(
-            lx - 4,
-            eyeY - 7,
-            lx + 4,
-            eyeY - 4,
-            SSD1306_WHITE
-        );
-
-        display.drawLine(
-            rx + 4,
-            eyeY - 7,
-            rx - 4,
-            eyeY - 4,
-            SSD1306_WHITE
-        );
-
-        // Mata
-        display.fillCircle(
-            lx,
-            eyeY,
-            3,
-            SSD1306_WHITE
-        );
-
-        display.fillCircle(
-            rx,
-            eyeY,
-            3,
-            SSD1306_WHITE
-        );
-
-        // Mulut sedih
-        drawFrown(
-            fx,
-            fy + 6,
-            9,
-            5
-        );
-
-        // Air mata
-        float p =
-            (t % 1400) /
-            1400.0;
-
-        int ty =
-            eyeY +
-            4 +
-            (int)(p * 20);
-
-        display.fillCircle(
-            lx,
-            ty,
-            2,
-            SSD1306_WHITE
-        );
-
-        if (p > 0.85)
-        {
-            display.drawPixel(
-                lx - 3,
-                ty,
-                SSD1306_WHITE
-            );
-
-            display.drawPixel(
-                lx + 3,
-                ty,
-                SSD1306_WHITE
-            );
-        }
-    }
-}
-
-// =====================================================
-// HEADER OLED
-// =====================================================
-
-void drawHeader()
-{
-    display.setTextColor(
-        SSD1306_WHITE
-    );
-
-    display.setTextSize(1);
-
-    // Baris atas:
-    // L:36% pH:7.01 23.5C
-
-    display.setCursor(
-        0,
-        0
-    );
-
-    display.print("L:");
-
-    display.print(
-        moisturePercent
-    );
-
-    display.print("%");
-
-    // pH
-    display.setCursor(
-        45,
-        0
-    );
-
-    display.print("pH:");
-
-    display.print(
-        pH,
-        2
-    );
-
-    // Suhu
-    display.setCursor(
-        96,
-        0
-    );
-
-    display.print(
-        temperatureC,
-        1
-    );
-
-    display.print("C");
-
-    // Garis pembatas
-    display.drawFastHLine(
-        0,
-        10,
-        SCREEN_WIDTH,
-        SSD1306_WHITE
-    );
+static void printHelp() {
+    Serial.println();
+    Serial.println(F("=========== POTANI READY ==========="));
+    Serial.println(F("Perintah serial:"));
+    Serial.println(F("  measure   -> mulai pengukuran"));
+    Serial.println(F("  selftest  -> verifikasi fuzzy (CSV)"));
+    Serial.println(F("===================================="));
 }
 
 // =====================================================
 // SETUP
 // =====================================================
-
-void setup()
-{
+void setup() {
     Serial.begin(115200);
+    delay(200);
 
-    // =================================================
-    // ADC
-    // =================================================
+    sensorsInit();
 
-    analogReadResolution(12);
-
-    analogSetPinAttenuation(
-        SOIL_PIN,
-        ADC_11db
-    );
-
-    analogSetPinAttenuation(
-        PH_PIN,
-        ADC_11db
-    );
-
-    // =================================================
-    // OLED
-    // =================================================
-
-    Wire.begin(
-        OLED_SDA,
-        OLED_SCL
-    );
-
-    if (
-        !display.begin(
-            SSD1306_SWITCHCAPVCC,
-            OLED_ADDR
-        )
-    )
-    {
-        Serial.println(
-            "OLED tidak ditemukan!"
-        );
-
-        while (true)
-        {
-            delay(100);
-        }
+    if (!displayInit()) {
+        Serial.println(F("OLED gagal. Berhenti."));
+        while (true) delay(100);
     }
 
-    // =================================================
-    // DS18B20
-    // =================================================
+    showSplash();
+    delay(2000);
 
-    temperatureSensor.begin();
+    // Jaringan dibangun di awal; kalau gagal, alat tetap jalan offline.
+    networkInit();
 
-    // =================================================
-    // SPLASH
-    // =================================================
-
-    display.clearDisplay();
-
-    display.setTextColor(
-        SSD1306_WHITE
-    );
-
-    display.setTextSize(2);
-
-    display.setCursor(
-        4,
-        8
-    );
-
-    display.println(
-        "ANIMASI"
-    );
-
-    display.setCursor(
-        40,
-        30
-    );
-
-    display.println(
-        "v5"
-    );
-
-    display.setTextSize(1);
-
-    display.setCursor(
-        15,
-        52
-    );
-
-    display.println(
-        "Soil + pH + Temp"
-    );
-
-    display.display();
-
-    delay(2500);
-
-    Serial.println();
-    Serial.println(
-        "================================"
-    );
-
-    Serial.println(
-        "SMART FARM MONITORING"
-    );
-
-    Serial.println(
-        "ESP32 + Soil + pH + DS18B20"
-    );
-
-    Serial.println(
-        "OLED"
-    );
-
-    Serial.println(
-        "================================"
-    );
+    printHelp();
+    state = S_IDLE;
 }
 
 // =====================================================
-// LOOP
+// LOOP — state machine
 // =====================================================
+void loop() {
+    networkLoop();  // jaga WiFi/MQTT & kirim ulang antrean
 
-void loop()
-{
-    unsigned long now =
-        millis();
+    String cmd = pollCommand();
 
-    // =================================================
-    // BACA SENSOR SETIAP 2 DETIK
-    // =================================================
-
-    if (
-        now - lastSensorRead >=
-        SENSOR_INTERVAL
-    )
-    {
-        lastSensorRead = now;
-
-        readSensors();
-
-        // =================================================
-        // SERIAL MONITOR
-        // =================================================
-
-        Serial.println();
-
-        Serial.println(
-            "========== SENSOR DATA =========="
-        );
-
-        Serial.print(
-            "Soil ADC       : "
-        );
-
-        Serial.println(
-            sensorValue
-        );
-
-        Serial.print(
-            "Kelembapan     : "
-        );
-
-        Serial.print(
-            moisturePercent
-        );
-
-        Serial.println("%");
-
-        Serial.print(
-            "Status         : "
-        );
-
-        Serial.println(
-            status
-        );
-
-        Serial.print(
-            "pH ADC         : "
-        );
-
-        Serial.println(
-            phADC
-        );
-
-        Serial.print(
-            "pH Voltage     : "
-        );
-
-        Serial.print(
-            phVoltage,
-            3
-        );
-
-        Serial.println(" V");
-
-        Serial.print(
-            "pH             : "
-        );
-
-        Serial.println(
-            pH,
-            2
-        );
-
-        Serial.print(
-            "Suhu DS18B20   : "
-        );
-
-        Serial.print(
-            temperatureC,
-            2
-        );
-
-        Serial.println(" C");
-
-        Serial.println(
-            "================================="
-        );
+    // selftest bisa dipanggil kapan saja saat idle
+    if (cmd == "selftest") {
+        runFuzzySelfTest();
     }
 
-    // =================================================
-    // OLED
-    // =================================================
+    unsigned long now = millis();
 
-    display.clearDisplay();
+    switch (state) {
 
-    drawHeader();
+        // -------------------------------------------------
+        case S_IDLE:
+            showIdle(isOnline());
+            if (triggerPressed(cmd)) {
+                Serial.println(F("Mulai pengukuran..."));
+                resetStability();
+                readingStart = now;
+                lastSampleAt = 0;
+                state = S_READING;
+            }
+            break;
 
-    drawFace(
-        faceState
-    );
+        // -------------------------------------------------
+        case S_READING: {
+            // Pembacaan awal lengkap + deteksi sensor.
+            lastReading = readAllSensors();
+            if (!lastReading.tempOk) {
+                state = S_ERROR;
+                break;
+            }
+            resetStability();
+            pushPH(lastReading.ph);
+            readingStart = now;
+            lastSampleAt = now;
+            showReading(20, isOnline());
+            state = S_STABILIZING;
+            break;
+        }
 
-    display.display();
+        // -------------------------------------------------
+        case S_STABILIZING: {
+            if (now - lastSampleAt >= READING_SAMPLE_MS) {
+                lastSampleAt = now;
+                pushPH(readPHValue());
+            }
 
-    // ~25 FPS
-    delay(40);
+            float spread  = phSpread();
+            unsigned long elapsed = now - readingStart;
+
+            // Deteksi kestabilan: selisih 5 pembacaan < 0.1 pH
+            // selama minimal 3 detik.
+            bool withinBand = (spread < STABILITY_THRESHOLD);
+            if (withinBand) {
+                if (stableSince == 0) stableSince = now;
+            } else {
+                stableSince = 0;
+            }
+
+            int progress;
+            if (stableSince > 0) {
+                progress = (int)((now - stableSince) * 100UL / STABILITY_MIN_MS);
+            } else {
+                progress = (int)(elapsed * 100UL / STABILITY_TIMEOUT_MS);
+            }
+            if (progress > 100) progress = 100;
+            if (progress < 0)   progress = 0;
+            showStabilizing(progress, (spread > 90 ? 0.0f : spread), isOnline());
+
+            bool stableReached =
+                (stableSince > 0) && (now - stableSince >= STABILITY_MIN_MS);
+            bool timedOut = (elapsed >= STABILITY_TIMEOUT_MS);
+
+            if (stableReached || timedOut) {
+                lastStable = stableReached;  // false bila mentok timeout
+                // Pembacaan akhir lengkap agar ketiga nilai sinkron.
+                lastReading = readAllSensors();
+                if (!lastReading.tempOk) {
+                    state = S_ERROR;
+                    break;
+                }
+                state = S_INFERENCE;
+            }
+            break;
+        }
+
+        // -------------------------------------------------
+        case S_INFERENCE: {
+            lastResult = fuzzyInfer(lastReading.moisture,
+                                    lastReading.ph,
+                                    lastReading.temperature);
+
+            Serial.println(F("---- HASIL FUZZY ----"));
+            Serial.print(F("Kelembapan : ")); Serial.print(lastReading.moisture, 1); Serial.println(F(" %"));
+            Serial.print(F("pH         : ")); Serial.print(lastReading.ph, 2);
+            Serial.println(lastReading.phValid ? F("") : F(" (di luar rentang, nilai lama)"));
+            Serial.print(F("Suhu       : ")); Serial.print(lastReading.temperature, 2); Serial.println(F(" C"));
+            Serial.print(F("Aturan aktif: ")); Serial.println(lastResult.activeRules);
+            Serial.print(F("Skor       : ")); Serial.println(lastResult.score, 2);
+            Serial.print(F("Status     : ")); Serial.println(statusLabel(lastResult.status));
+            Serial.print(F("Stabil     : ")); Serial.println(lastStable ? F("ya") : F("tidak"));
+
+            displayStart = now;
+            state = S_DISPLAY;
+            break;
+        }
+
+        // -------------------------------------------------
+        case S_DISPLAY:
+            showResult(lastReading, lastResult, lastStable, isOnline());
+            // tahan 15 detik atau sampai tombol/measure ditekan
+            if (now - displayStart >= DISPLAY_HOLD_MS || triggerPressed(cmd)) {
+                state = S_PUBLISH;
+            }
+            break;
+
+        // -------------------------------------------------
+        case S_PUBLISH:
+            publishReading(lastReading, lastResult, lastStable);
+            Serial.println(F("Kembali ke IDLE."));
+            state = S_IDLE;
+            break;
+
+        // -------------------------------------------------
+        case S_ERROR:
+            showError("Sensor tidak\nterdeteksi.\nCek DS18B20.", isOnline());
+            // tekan measure untuk coba lagi
+            if (triggerPressed(cmd)) {
+                state = S_IDLE;
+            }
+            break;
+    }
+
+    delay(30);  // ~30 FPS untuk animasi wajah
 }
